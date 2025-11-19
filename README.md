@@ -3,7 +3,7 @@
 
 当前资源版本：
 > LauncherVersion：2.8.0<br/>
-> LauncherList：5326747<br/>
+> LauncherList：5388307<br/>
 > ResourceVersion：2.8.6<br/>
 > ResourceList：5550037
 
