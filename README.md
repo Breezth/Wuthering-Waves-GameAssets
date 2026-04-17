@@ -3,14 +3,17 @@
 
 当前资源版本：
 > LauncherVersion：3.2.0<br/>
-> LauncherList：6569242<br/>
-> ResourceVersion：3.2.9<br/>
-> ResourceList：6770228
+> LauncherList：6711476<br/>
+> ResourceVersion：3.2.13<br/>
+> ResourceList：7072060
 
 部分内容由于未采用Texture2D类，故未被提取；部分内容未在Client/Content/Aki/UI目录下，未被提取<br/>
 
 无更新版本：<br/>
 3.2
+* 3.2.12（6962755）
+* 3.2.11（6883269）
+* 3.2.10（6807300）
 * 3.2.8（6745402）
 * 3.2.7（6733950）
 * 3.2.6（6728977）
