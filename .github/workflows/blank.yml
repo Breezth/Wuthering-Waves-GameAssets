@@ -3,7 +3,7 @@ name: hi
 on:
   push:
     branches:
-      - 'main'
+      - 'beta3.5'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
