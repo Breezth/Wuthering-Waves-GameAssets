@@ -37,7 +37,6 @@ jobs:
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       DEPLOY_WORKERS: "8"
       MAX_RUN_MINUTES: "300"
-      DEPLOY_REPORT: ${{ runner.temp }}/rains3-report.jsonl
 
     steps:
       - name: Checkout current main
@@ -63,6 +62,7 @@ jobs:
       - name: Compare and resume upload
         shell: bash
         env:
+          DEPLOY_REPORT: ${{ runner.temp }}/rains3-report.jsonl
           AWS_ACCESS_KEY_ID: ${{ secrets.SFTP_USERNAME }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SFTP_PASSWORD }}
           FORCE_PATH: ${{ inputs.force_path }}
