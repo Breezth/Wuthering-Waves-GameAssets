@@ -2,18 +2,15 @@ name: Deploy Assets to RainS3
 
 on:
   push:
-    branches:
-      - main
-
+    branches: [main]
   workflow_dispatch:
     inputs:
       force_path:
-        description: "强制重新转换并上传的文件路径；通常留空"
+        description: "强制转换并覆盖单个文件；恢复全库时留空"
         required: false
         type: string
-
       full_rebuild:
-        description: "重新转换并上传仓库中的全部文件"
+        description: "全库比对并补齐（兼容旧选项；不勾选也会全库比对）"
         required: false
         default: false
         type: boolean
@@ -21,489 +18,471 @@ on:
 permissions:
   contents: read
 
-# 防止多个部署同时修改同一个对象。
-# queue: max 会让后续部署排队，而不是丢弃中间的部署。
 concurrency:
   group: rains3-deploy-main
   queue: max
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
-
     env:
       S3_BUCKET: wutherin
       S3_ENDPOINT: https://cn-nb1.rains3.com
-
       AWS_DEFAULT_REGION: cn-nb1
       AWS_REGION: cn-nb1
-
-      # AWS CLI 单个请求的自动重试
-      AWS_RETRY_MODE: standard
-      AWS_MAX_ATTEMPTS: "10"
-
-      # 提高新版 AWS CLI 对第三方 S3 服务的兼容性
+      AWS_EC2_METADATA_DISABLED: "true"
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-
-      # 不查询 EC2 元数据服务
-      AWS_EC2_METADATA_DISABLED: "true"
+      DEPLOY_WORKERS: "8"
+      MAX_RUN_MINUTES: "300"
+      DEPLOY_REPORT: ${{ runner.temp }}/rains3-report.jsonl
 
     steps:
-      # 1. 清理 GitHub Runner 中不需要的大型组件
-      - name: Free Disk Space
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== 开始清理 Runner 空间 ==="
-
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-
-          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
-            sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          fi
-
-          echo "=== 当前磁盘空间 ==="
-          df -h
-
-      # 2. 拉取完整 Git 历史，以便比较 push 前后的真实变更
-      - name: Checkout Repository
+      - name: Checkout current main
         uses: actions/checkout@v7
+        timeout-minutes: 30
         with:
-          fetch-depth: 0
+          # 即使重跑旧任务，也读取最新 main，避免部署过时资产。
+          ref: main
+          fetch-depth: 1
           persist-credentials: false
 
-      # 3. 安装 WebP 转换工具
-      - name: Install Required Tools
+      - name: Install tools
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail
-
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends webp
-          sudo apt-get clean
-
-          echo "=== 工具版本 ==="
+          python3 -m venv "$RUNNER_TEMP/rains3-venv"
+          "$RUNNER_TEMP/rains3-venv/bin/python" -m pip install --disable-pip-version-check 'boto3>=1.36,<2'
           cwebp -version
-          aws --version
 
-      # 4. 根据 Git 内容变化生成待上传文件清单
-      - name: Detect Changed Files
-        id: changes
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.sha }}
-          FORCE_PATH: ${{ inputs.force_path }}
-          FULL_REBUILD: ${{ inputs.full_rebuild }}
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-          import json
-          import os
-          import subprocess
-          from pathlib import PurePosixPath
-
-          event_name = os.environ.get("EVENT_NAME", "")
-          before_sha = os.environ.get("BEFORE_SHA", "")
-          after_sha = os.environ.get("AFTER_SHA", "") or "HEAD"
-          force_path = os.environ.get("FORCE_PATH", "").strip()
-          full_rebuild = (
-              os.environ.get("FULL_REBUILD", "").strip().lower() == "true"
-          )
-
-          ZERO_SHA = "0" * 40
-
-          def run_bytes(args):
-              return subprocess.check_output(args)
-
-          def commit_exists(ref):
-              if not ref:
-                  return False
-
-              result = subprocess.run(
-                  ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
-                  stdout=subprocess.DEVNULL,
-                  stderr=subprocess.DEVNULL,
-                  check=False,
-              )
-              return result.returncode == 0
-
-          def normalize_path(raw_path):
-              path = raw_path.replace("\\", "/")
-
-              while path.startswith("./"):
-                  path = path[2:]
-
-              posix_path = PurePosixPath(path)
-
-              if not path:
-                  raise ValueError("文件路径不能为空")
-
-              if posix_path.is_absolute():
-                  raise ValueError(f"不允许绝对路径：{path}")
-
-              if ".." in posix_path.parts:
-                  raise ValueError(f"不允许路径穿越：{path}")
-
-              return posix_path.as_posix()
-
-          def is_excluded(path):
-              return (
-                  path == ".git"
-                  or path.startswith(".git/")
-                  or path == ".github"
-                  or path.startswith(".github/")
-              )
-
-          def get_all_tracked_files():
-              raw = run_bytes(["git", "ls-files", "-z"])
-
-              files = set()
-
-              for item in raw.split(b"\0"):
-                  if not item:
-                      continue
-
-                  path = normalize_path(os.fsdecode(item))
-
-                  if not is_excluded(path):
-                      files.add(path)
-
-              return files
-
-          def get_changed_files(base, head):
-              # --no-renames：
-              # 重命名会被视为“删除旧文件 + 新增新文件”。
-              # 这里只取新增、修改和类型变化后的新文件。
-              raw = run_bytes([
-                  "git",
-                  "diff",
-                  "--name-only",
-                  "--diff-filter=AMT",
-                  "--no-renames",
-                  "-z",
-                  base,
-                  head,
-                  "--",
-              ])
-
-              files = set()
-
-              for item in raw.split(b"\0"):
-                  if not item:
-                      continue
-
-                  path = normalize_path(os.fsdecode(item))
-
-                  if not is_excluded(path):
-                      files.add(path)
-
-              return files
-
-          mode = ""
-          upload_files = set()
-
-          # 手动指定某个文件，强制重新处理
-          if force_path:
-              path = normalize_path(force_path)
-
-              if is_excluded(path):
-                  raise SystemExit(f"该路径已被排除，无法上传：{path}")
-
-              if not os.path.isfile(path):
-                  raise SystemExit(f"指定文件不存在：{path}")
-
-              upload_files = {path}
-              mode = "force_path"
-
-          # 手动执行全部重建
-          elif full_rebuild:
-              upload_files = get_all_tracked_files()
-              mode = "full_rebuild"
-
-          # 正常 push：比较 push 前后的所有变化
-          elif (
-              event_name == "push"
-              and before_sha
-              and before_sha != ZERO_SHA
-              and commit_exists(before_sha)
-          ):
-              upload_files = get_changed_files(before_sha, after_sha)
-              mode = f"push_diff:{before_sha[:8]}..{after_sha[:8]}"
-
-          # 手动运行但未指定路径：默认处理最近一次提交
-          elif commit_exists("HEAD^"):
-              upload_files = get_changed_files("HEAD^", "HEAD")
-              mode = "fallback:HEAD^..HEAD"
-
-          # 没有可比较的父提交时，全量处理
-          else:
-              upload_files = get_all_tracked_files()
-              mode = "fallback_full_rebuild"
-
-          # 最后再次确认文件确实存在
-          upload_files = {
-              path
-              for path in upload_files
-              if os.path.isfile(path) and not is_excluded(path)
-          }
-
-          manifest = {
-              "mode": mode,
-              "files": sorted(upload_files),
-          }
-
-          with open(
-              "deploy_manifest.json",
-              "w",
-              encoding="utf-8",
-          ) as file:
-              json.dump(
-                  manifest,
-                  file,
-                  ensure_ascii=False,
-                  indent=2,
-              )
-
-          print("=== Git 变更检测报告 ===")
-          print(f"检测模式：{mode}")
-          print(f"待处理文件数：{len(upload_files)}")
-
-          for path in sorted(upload_files)[:30]:
-              print(f"  {path}")
-
-          if len(upload_files) > 30:
-              print(f"  ……其余 {len(upload_files) - 30} 个文件省略")
-
-          with open(
-              os.environ["GITHUB_OUTPUT"],
-              "a",
-              encoding="utf-8",
-          ) as output:
-              output.write(f"file_count={len(upload_files)}\n")
-          PY
-
-      # 5. 创建纯增量上传目录
-      #
-      # PNG：
-      #   UI/test.png
-      # 转换为：
-      #   .deploy/UI/test.webp
-      #
-      # 其他变更文件保持原路径复制。
-      - name: Build Deployment Payload
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-          import json
-          import os
-          import shutil
-          import subprocess
-          from concurrent.futures import ThreadPoolExecutor
-          from pathlib import Path, PurePosixPath
-
-          with open(
-              "deploy_manifest.json",
-              "r",
-              encoding="utf-8",
-          ) as file:
-              manifest = json.load(file)
-
-          source_files = manifest["files"]
-
-          deploy_root = Path(".deploy")
-
-          shutil.rmtree(deploy_root, ignore_errors=True)
-          deploy_root.mkdir(parents=True, exist_ok=True)
-
-          def get_remote_key(source_path):
-              path = PurePosixPath(source_path)
-
-              if path.suffix.lower() == ".png":
-                  path = path.with_suffix(".webp")
-
-              return path.as_posix()
-
-          # 防止 foo.png 和 foo.webp 最终对应同一个远端 key
-          remote_keys = {}
-
-          for source_path in source_files:
-              key = get_remote_key(source_path)
-
-              if key in remote_keys:
-                  raise RuntimeError(
-                      "检测到远端路径冲突："
-                      f"{remote_keys[key]} 和 {source_path} "
-                      f"都会写入 {key}"
-                  )
-
-              remote_keys[key] = source_path
-
-          def get_destination(key):
-              parts = PurePosixPath(key).parts
-              return deploy_root.joinpath(*parts)
-
-          def build_one(source_path):
-              source = Path(source_path)
-              remote_key = get_remote_key(source_path)
-              destination = get_destination(remote_key)
-
-              destination.parent.mkdir(
-                  parents=True,
-                  exist_ok=True,
-              )
-
-              if source.suffix.lower() == ".png":
-                  subprocess.run(
-                      [
-                          "cwebp",
-                          "-quiet",
-                          "-q",
-                          "85",
-                          "-m",
-                          "4",
-                          str(source),
-                          "-o",
-                          str(destination),
-                      ],
-                      check=True,
-                  )
-              else:
-                  shutil.copy2(source, destination)
-
-              return remote_key
-
-          completed = 0
-          total = len(source_files)
-
-          with ThreadPoolExecutor(max_workers=2) as executor:
-              for remote_key in executor.map(build_one, source_files):
-                  completed += 1
-
-                  if completed % 50 == 0 or completed == total:
-                      print(
-                          f"处理进度：{completed}/{total}，"
-                          f"最近完成：{remote_key}"
-                      )
-
-          payload_files = [
-              path
-              for path in deploy_root.rglob("*")
-              if path.is_file()
-          ]
-
-          print("=== 构建结果 ===")
-          print(f"源文件数量：{total}")
-          print(f"上传文件数量：{len(payload_files)}")
-          PY
-
-      # 6. 检查本次增量包大小
-      - name: Check Payload Size
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          REAL_SIZE_KB=$(du -s .deploy | awk '{print $1}')
-          REAL_SIZE_GB=$(awk \
-            "BEGIN {printf \"%.3f\", $REAL_SIZE_KB/1024/1024}")
-
-          FILE_COUNT=$(find .deploy -type f | wc -l)
-
-          echo "=============================================="
-          echo "本次增量文件数量：$FILE_COUNT"
-          echo "本次增量包大小：$REAL_SIZE_GB GiB"
-          echo "=============================================="
-
-          # 18 GiB 安全限制
-          if [ "$REAL_SIZE_KB" -gt 18874368 ]; then
-            echo "【安全拦截】本次增量包超过 18 GiB。"
-            echo "如确实需要全量上传，请确认 Runner 空间后调整限制。"
-            exit 1
-          fi
-
-      # 7. 上传增量文件
-      #
-      # 使用 cp 而不是 sync：
-      # cp 会明确上传 .deploy 中的每个文件，
-      # 因此同路径、同大小但内容不同的文件仍会被覆盖。
-      - name: Upload Changed Files to RainS3
+      - name: Compare and resume upload
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.SFTP_USERNAME }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SFTP_PASSWORD }}
+          FORCE_PATH: ${{ inputs.force_path }}
         run: |
           set -euo pipefail
+          "$RUNNER_TEMP/rains3-venv/bin/python" -u <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import mimetypes
+          import os
+          import subprocess
+          import tempfile
+          import threading
+          import time
+          from collections import Counter
+          from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+          from pathlib import Path, PurePosixPath
 
-          if ! find .deploy -type f -print -quit | grep -q .; then
-            echo "本次没有需要上传的文件。"
-            exit 0
-          fi
+          import boto3
+          from boto3.s3.transfer import TransferConfig
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
 
-          upload_once() {
-            echo "上传非 WebP 文件……"
+          CACHE_CONTROL = "no-cache,max-age=0,must-revalidate"
+          STATE_ROOT = "__rains3_deploy_state_v2__/"
 
-            aws s3 cp \
-              .deploy/ \
-              "s3://${S3_BUCKET}/" \
-              --recursive \
-              --exclude "*.webp" \
-              --endpoint-url "$S3_ENDPOINT" \
-              --cache-control \
-                "no-cache,max-age=0,must-revalidate" \
-              --only-show-errors \
-              --no-progress \
-              --cli-connect-timeout 60 \
-              --cli-read-timeout 300 \
-              || return 1
 
-            echo "上传 WebP 文件……"
+          class BudgetExpired(Exception):
+              pass
 
-            aws s3 cp \
-              .deploy/ \
-              "s3://${S3_BUCKET}/" \
-              --recursive \
-              --exclude "*" \
-              --include "*.webp" \
-              --content-type "image/webp" \
-              --endpoint-url "$S3_ENDPOINT" \
-              --cache-control \
-                "no-cache,max-age=0,must-revalidate" \
-              --only-show-errors \
-              --no-progress \
-              --cli-connect-timeout 60 \
-              --cli-read-timeout 300 \
-              || return 1
-          }
 
-          for ATTEMPT in 1 2 3; do
-            echo "=============================================="
-            echo "开始第 ${ATTEMPT}/3 次完整上传尝试"
-            echo "=============================================="
+          def digest(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
 
-            if upload_once; then
-              echo "RainS3 增量上传完成。"
-              exit 0
-            fi
 
-            if [ "$ATTEMPT" -lt 3 ]; then
-              WAIT_SECONDS=$((ATTEMPT * 30))
+          def remote_key(path):
+              p = PurePosixPath(path)
+              return str(p.with_suffix(".webp") if p.suffix.lower() == ".png" else p)
 
-              echo "本轮上传失败。"
-              echo "${WAIT_SECONDS} 秒后重新上传本次增量包……"
 
-              sleep "$WAIT_SECONDS"
-            fi
-          done
+          def tracked_files():
+              raw = subprocess.check_output(["git", "ls-files", "--stage", "-z"])
+              files = []
+              keys = {}
+              for entry in raw.split(b"\0"):
+                  if not entry:
+                      continue
+                  info, name = entry.split(b"\t", 1)
+                  name = name.decode("utf-8")
+                  if PurePosixPath(name).parts[0] in {".git", ".github"}:
+                      continue
+                  if name.startswith(STATE_ROOT):
+                      raise RuntimeError(f"仓库文件占用了同步记录保留路径：{name}")
+                  mode, _, stage = info.decode().split()
+                  if mode not in {"100644", "100755"} or stage != "0":
+                      raise RuntimeError(f"不支持符号链接、子模块或冲突文件：{name}")
+                  if not Path(name).is_file():
+                      raise RuntimeError(f"跟踪文件不存在：{name}")
+                  key = remote_key(name)
+                  if key in keys:
+                      raise RuntimeError(f"远端路径冲突：{keys[key]} 和 {name} -> {key}")
+                  keys[key] = name
+                  files.append(name)
+              return sorted(files)
 
-          echo "连续三轮上传均失败。"
-          exit 1
+
+          def object_token(obj):
+              if not obj or not obj.get("ETag") or obj.get("LastModified") is None:
+                  return None
+              size = obj.get("Size", obj.get("ContentLength"))
+              if size is None:
+                  return None
+              # ETag 是远端版本比较标记，不将它解释为内容 MD5。
+              return [obj["ETag"], int(size), str(obj["LastModified"])]
+
+
+          class Checkpoints:
+              SHARDS = 64
+
+              def __init__(self, client, bucket, inventory, namespace="default"):
+                  self.s3 = client
+                  self.bucket = bucket
+                  self.prefix = STATE_ROOT + hashlib.sha256(namespace.encode()).hexdigest()[:16] + "/"
+                  self.data = [{} for _ in range(self.SHARDS)]
+                  self.dirty = [0] * self.SHARDS
+                  self.locks = [threading.Lock() for _ in range(self.SHARDS)]
+
+                  def load_shard(i):
+                      key = self.key(i)
+                      if key not in inventory:
+                          return
+                      try:
+                          response = self.s3.get_object(Bucket=bucket, Key=key)
+                      except ClientError as exc:
+                          if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                              return
+                          raise
+                      stream = response["Body"]
+                      try:
+                          raw = stream.read()
+                      finally:
+                          stream.close()
+                      try:
+                          decoded = json.loads(gzip.decompress(raw))
+                          if decoded.get("version") != 2 or not isinstance(decoded.get("files"), dict):
+                              raise ValueError("unsupported checkpoint format")
+                          self.data[i] = decoded["files"]
+                      except (ValueError, OSError, EOFError, AttributeError):
+                          print(f"同步记录分片 {i} 损坏，将重新比对该分片的资产。", flush=True)
+
+                  with ThreadPoolExecutor(max_workers=8) as pool:
+                      list(pool.map(load_shard, range(self.SHARDS)))
+
+              def shard(self, key):
+                  return hashlib.sha256(key.encode()).digest()[0] % self.SHARDS
+
+              def key(self, i):
+                  return f"{self.prefix}{i:02x}.json.gz"
+
+              def matches(self, key, source_hash, recipe_hash, listed):
+                  token = object_token(listed)
+                  if token is None:
+                      return False
+                  i = self.shard(key)
+                  with self.locks[i]:
+                      record = self.data[i].get(key)
+                      return isinstance(record, dict) and record == {
+                          "source": source_hash, "recipe": recipe_hash, "remote": token
+                      }
+
+              def remember(self, key, source_hash, recipe_hash, verified):
+                  token = object_token(verified)
+                  if token is None:
+                      return
+                  i = self.shard(key)
+                  with self.locks[i]:
+                      record = {"source": source_hash, "recipe": recipe_hash, "remote": token}
+                      if self.data[i].get(key) != record:
+                          self.data[i][key] = record
+                          self.dirty[i] += 1
+                      # 小分片周期性落盘，避免十几万条的大清单反复重写。
+                      if self.dirty[i] >= 128:
+                          self.save_locked(i)
+
+              def save_locked(self, i):
+                  if not self.dirty[i]:
+                      return
+                  payload = gzip.compress(json.dumps(
+                      {"version": 2, "files": self.data[i]},
+                      ensure_ascii=False, separators=(",", ":"),
+                  ).encode(), compresslevel=1)
+                  self.s3.put_object(Bucket=self.bucket, Key=self.key(i), Body=payload,
+                                     ContentType="application/gzip", CacheControl="no-store")
+                  self.dirty[i] = 0
+
+              def flush(self):
+                  def save(i):
+                      with self.locks[i]:
+                          self.save_locked(i)
+                  with ThreadPoolExecutor(max_workers=8) as pool:
+                      list(pool.map(save, range(self.SHARDS)))
+
+
+          class Deployment:
+              def __init__(self, client, bucket, deadline, webp_version):
+                  self.s3 = client
+                  self.bucket = bucket
+                  self.deadline = deadline
+                  self.webp_version = webp_version
+                  self.inventory = None
+                  self.checkpoints = None
+                  self.conversions = threading.Semaphore(2)
+                  self.transfer = TransferConfig(
+                      multipart_threshold=64 * 1024 * 1024,
+                      multipart_chunksize=64 * 1024 * 1024,
+                      max_concurrency=2,
+                      use_threads=True,
+                  )
+
+              def check_time(self, *_):
+                  if time.monotonic() >= self.deadline:
+                      raise BudgetExpired("本轮时间预算已用完，下次运行继续")
+
+              def prepare(self, namespace):
+                  self.inventory = {}
+                  pages = self.s3.get_paginator("list_objects_v2").paginate(
+                      Bucket=self.bucket, PaginationConfig={"PageSize": 1000}
+                  )
+                  for n, page in enumerate(pages, 1):
+                      self.check_time()
+                      for obj in page.get("Contents", []):
+                          self.inventory[obj["Key"]] = obj
+                      if n % 25 == 0:
+                          print(f"批量列举远端：{n} 页，{len(self.inventory)} 个对象", flush=True)
+                  print(f"远端清单读取完成：{len(self.inventory)} 个对象", flush=True)
+                  self.checkpoints = Checkpoints(self.s3, self.bucket, self.inventory, namespace)
+
+              def remember(self, key, source_hash, recipe_hash, verified):
+                  if self.checkpoints:
+                      self.checkpoints.remember(key, source_hash, recipe_hash, verified)
+
+              def head(self, key):
+                  try:
+                      return self.s3.head_object(Bucket=self.bucket, Key=key)
+                  except ClientError as exc:
+                      # 403、限流和网络错误绝不能当成对象不存在。
+                      if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                          return None
+                      raise
+
+              def remote_digest(self, key, head):
+                  response = self.s3.get_object(
+                      Bucket=self.bucket, Key=key, IfMatch=head["ETag"]
+                  )
+                  h = hashlib.sha256()
+                  stream = response["Body"]
+                  try:
+                      for chunk in stream.iter_chunks(chunk_size=1024 * 1024):
+                          self.check_time()
+                          h.update(chunk)
+                  finally:
+                      stream.close()
+                  return h.hexdigest()
+
+              def process(self, name, force=False):
+                  self.check_time()
+                  source = Path(name)
+                  key = remote_key(name)
+                  content_type = (
+                      "image/webp" if PurePosixPath(key).suffix.lower() == ".webp"
+                      else mimetypes.guess_type(key)[0] or "application/octet-stream"
+                  )
+                  recipe = (
+                      f"png:webp:q85:m4:{self.webp_version}"
+                      if source.suffix.lower() == ".png" else "identity:v1"
+                  )
+                  # 输出策略发生改变时，也会触发重新部署。
+                  recipe_hash = hashlib.sha256(
+                      f"rains3-v1|{recipe}|{content_type}|{CACHE_CONTROL}".encode()
+                  ).hexdigest()
+                  source_hash = digest(source)
+                  self.check_time()
+                  if not force and self.checkpoints and self.checkpoints.matches(
+                      key, source_hash, recipe_hash, self.inventory.get(key)
+                  ):
+                      return "index_skipped"
+                  # 空桶/远端缺失文件直接上传，省去一次逐文件 HEAD。
+                  head = self.head(key) if self.inventory is None or key in self.inventory else None
+                  metadata = head.get("Metadata", {}) if head else {}
+                  if not force and head and (
+                      metadata.get("deploy-source-sha256") == source_hash
+                      and metadata.get("deploy-recipe-sha256") == recipe_hash
+                      and metadata.get("deploy-output-size") == str(head["ContentLength"])
+                      and len(metadata.get("deploy-output-sha256", "")) == 64
+                      and head.get("ContentType") == content_type
+                      and head.get("CacheControl") == CACHE_CONTROL
+                  ):
+                      self.remember(key, source_hash, recipe_hash, head)
+                      return "skipped"
+
+                  # 每个工作线程最多保存一个临时转换结果；成功或失败均清理。
+                  with tempfile.TemporaryDirectory(prefix="rains3-") as temporary:
+                      payload = source
+                      if source.suffix.lower() == ".png":
+                          self.check_time()
+                          payload = Path(temporary) / "payload.webp"
+                          with self.conversions:
+                              self.check_time()
+                              subprocess.run(
+                                  ["cwebp", "-quiet", "-q", "85", "-m", "4",
+                                   str(source.resolve()), "-o", str(payload)],
+                                  check=True,
+                                  timeout=max(1, self.deadline - time.monotonic()),
+                              )
+                      size = payload.stat().st_size
+                      output_hash = digest(payload)
+                      self.check_time()
+                      # 兼容旧脚本：不把 multipart ETag 当 MD5，也不只看文件大小。
+                      # 内容相同的旧对象也保存同步记录，下轮无需再次下载。
+                      if not force and head and head["ContentLength"] == size:
+                          if self.remote_digest(key, head) == output_hash and (
+                              head.get("ContentType") == content_type
+                              and head.get("CacheControl") == CACHE_CONTROL
+                          ):
+                              self.remember(key, source_hash, recipe_hash, head)
+                              return "content_matched"
+
+                      self.check_time()
+                      expected = {
+                          "deploy-source-sha256": source_hash,
+                          "deploy-recipe-sha256": recipe_hash,
+                          "deploy-output-sha256": output_hash,
+                          "deploy-output-size": str(size),
+                      }
+                      # 文件内容与指纹在同一次上传中提交，无需另外保存断点文件。
+                      self.s3.upload_file(
+                          str(payload), self.bucket, key,
+                          ExtraArgs={"Metadata": expected, "ContentType": content_type,
+                                     "CacheControl": CACHE_CONTROL},
+                          Config=self.transfer, Callback=self.check_time,
+                      )
+                      verified = self.head(key)
+                      if not verified or verified["ContentLength"] != size or any(
+                          verified.get("Metadata", {}).get(k) != v for k, v in expected.items()
+                      ):
+                          raise RuntimeError("上传后远端大小或指纹校验失败")
+                      self.remember(key, source_hash, recipe_hash, verified)
+                      return "uploaded"
+
+
+          def run_batch(deployment, files, workers, force_path, report):
+              counts = Counter()
+              iterator = iter(files)
+              pending = {}
+              last_flush = time.monotonic()
+              report_path = Path(report)
+              report_path.parent.mkdir(parents=True, exist_ok=True)
+              with report_path.open("w", encoding="utf-8") as log, ThreadPoolExecutor(max_workers=workers) as pool:
+                  def fill():
+                      while len(pending) < workers:
+                          if time.monotonic() >= deployment.deadline:
+                              return
+                          name = next(iterator, None)
+                          if name is None:
+                              return
+                          pending[pool.submit(deployment.process, name, name == force_path)] = name
+
+                  fill()
+                  while pending:
+                      done, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                      if not done:
+                          print(f"处理中；已检查 {sum(counts.values())}/{len(files)}", flush=True)
+                      for future in done:
+                          name = pending.pop(future)
+                          try:
+                              status = future.result()
+                              detail = ""
+                          except Exception as exc:
+                              status = "deferred" if time.monotonic() >= deployment.deadline else "failed"
+                              detail = str(exc)
+                          counts[status] += 1
+                          log.write(json.dumps({"file": name, "status": status, "detail": detail}, ensure_ascii=False) + "\n")
+                          log.flush()
+                          if status in {"failed", "deferred"}:
+                              print(json.dumps({"file": name, "status": status, "detail": detail}, ensure_ascii=False), flush=True)
+                          elif sum(counts.values()) % 1000 == 0:
+                              print(f"已检查 {sum(counts.values())}/{len(files)}；{dict(counts)}", flush=True)
+                      if deployment.checkpoints and time.monotonic() - last_flush >= 240:
+                          deployment.checkpoints.flush()
+                          last_flush = time.monotonic()
+                      fill()
+              if deployment.checkpoints:
+                  deployment.checkpoints.flush()
+              remaining = len(files) - sum(counts.values()) + counts["deferred"] + counts["failed"]
+              summary = (
+                  f"总文件：{len(files)}\n\n"
+                  f"本轮上传：{counts['uploaded']}；批量索引跳过：{counts['index_skipped']}；指纹跳过：{counts['skipped']}；"
+                  f"内容相同跳过：{counts['content_matched']}\n\n"
+                  f"失败：{counts['failed']}；仍需处理：{remaining}\n\n"
+              )
+              if remaining:
+                  summary += "尚未完成。再次 Run workflow（force_path 留空）即可继续；失败详情见 rains3-report。\n"
+              else:
+                  summary += "本轮所选文件已全部同步。\n"
+              print(summary, flush=True)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+                      stream.write(summary)
+              return 1 if remaining else 0
+
+
+          def main():
+              files = tracked_files()  # 所有模式都先检查全仓库 key 冲突。
+              force_path = os.environ.get("FORCE_PATH", "").strip().replace("\\", "/")
+              if force_path:
+                  p = PurePosixPath(force_path)
+                  if p.is_absolute() or ".." in p.parts:
+                      raise RuntimeError("force_path 必须是仓库内相对文件路径")
+                  force_path = p.as_posix()
+                  if force_path not in files:
+                      raise RuntimeError("force_path 不存在、未被 Git 跟踪或已被排除")
+                  files = [force_path]
+              workers = int(os.environ.get("DEPLOY_WORKERS", "8"))
+              minutes = int(os.environ.get("MAX_RUN_MINUTES", "300"))
+              if not 1 <= workers <= 16 or not 1 <= minutes <= 300:
+                  raise RuntimeError("DEPLOY_WORKERS 应为 1..16，MAX_RUN_MINUTES 应为 1..300")
+              version = subprocess.check_output(["cwebp", "-version"], text=True).strip()
+              client = boto3.client(
+                  "s3", endpoint_url=os.environ["S3_ENDPOINT"],
+                  region_name=os.environ.get("AWS_REGION", "cn-nb1"),
+                  config=Config(
+                      signature_version="s3v4", s3={"addressing_style": "path"},
+                      retries={"mode": "standard", "total_max_attempts": 5},
+                      connect_timeout=15, read_timeout=60, max_pool_connections=workers * 3,
+                      request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required",
+                  ),
+              )
+              print(f"比对文件数：{len(files)}；并行数：{workers}；预算：{minutes} 分钟", flush=True)
+              deployment = Deployment(client, os.environ["S3_BUCKET"], time.monotonic() + minutes * 60, version)
+              deployment.prepare(os.environ.get("GITHUB_REPOSITORY", "default"))
+              # 先补缺失资产，避免恢复时间被大量旧对象的首次内容检查占满。
+              files.sort(key=lambda name: (remote_key(name) in deployment.inventory, name))
+              return run_batch(deployment, files, workers, force_path, os.environ["DEPLOY_REPORT"])
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
+
+      - name: Save per-file report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rains3-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rains3-report.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
