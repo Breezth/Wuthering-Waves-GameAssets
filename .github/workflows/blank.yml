@@ -85,7 +85,7 @@ jobs:
           import boto3
           from boto3.s3.transfer import TransferConfig
           from botocore.config import Config
-          from botocore.exceptions import ClientError
+          from botocore.exceptions import BotoCoreError, ClientError
 
           CACHE_CONTROL = "no-cache,max-age=0,must-revalidate"
           STATE_ROOT = "__rains3_deploy_state_v2__/"
@@ -154,6 +154,10 @@ jobs:
                   self.data = [{} for _ in range(self.SHARDS)]
                   self.dirty = [0] * self.SHARDS
                   self.locks = [threading.Lock() for _ in range(self.SHARDS)]
+                  self.write_slots = threading.Semaphore(2)
+                  self.status_lock = threading.Lock()
+                  self.retry_after = 0.0
+                  self.load_failures = [False] * self.SHARDS
 
                   def load_shard(i):
                       key = self.key(i)
@@ -161,24 +165,30 @@ jobs:
                           return
                       try:
                           response = self.s3.get_object(Bucket=bucket, Key=key)
-                      except ClientError as exc:
-                          if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+                          stream = response["Body"]
+                          try:
+                              raw = stream.read()
+                          finally:
+                              stream.close()
+                      except (BotoCoreError, ClientError, OSError) as exc:
+                          if isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") in {
+                              "404", "NoSuchKey", "NotFound"
+                          }:
                               return
-                          raise
-                      stream = response["Body"]
-                      try:
-                          raw = stream.read()
-                      finally:
-                          stream.close()
+                          self.load_failures[i] = True
+                          print(f"::warning::同步记录分片 {i:02x} 读取失败（{type(exc).__name__}）；"
+                                "回退到远端资产元数据或内容比对，资产处理继续。", flush=True)
+                          return
                       try:
                           decoded = json.loads(gzip.decompress(raw))
                           if decoded.get("version") != 2 or not isinstance(decoded.get("files"), dict):
                               raise ValueError("unsupported checkpoint format")
                           self.data[i] = decoded["files"]
                       except (ValueError, OSError, EOFError, AttributeError):
-                          print(f"同步记录分片 {i} 损坏，将重新比对该分片的资产。", flush=True)
+                          self.load_failures[i] = True
+                          print(f"::warning::同步记录分片 {i:02x} 损坏，将重新比对该分片的资产。", flush=True)
 
-                  with ThreadPoolExecutor(max_workers=8) as pool:
+                  with ThreadPoolExecutor(max_workers=2) as pool:
                       list(pool.map(load_shard, range(self.SHARDS)))
 
               def shard(self, key):
@@ -208,35 +218,54 @@ jobs:
                       if self.data[i].get(key) != record:
                           self.data[i][key] = record
                           self.dirty[i] += 1
-                      # 小分片周期性落盘，避免十几万条的大清单反复重写。
                       if self.dirty[i] >= 128:
                           self.save_locked(i)
 
               def save_locked(self, i):
                   if not self.dirty[i]:
                       return
-                  payload = gzip.compress(json.dumps(
-                      {"version": 2, "files": self.data[i]},
-                      ensure_ascii=False, separators=(",", ":"),
-                  ).encode(), compresslevel=1)
-                  self.s3.put_object(Bucket=self.bucket, Key=self.key(i), Body=payload,
-                                     ContentType="application/gzip", CacheControl="no-store")
-                  self.dirty[i] = 0
+                  # 自动保存和集中保存共用限流及退避；失败不清除 dirty 标记。
+                  with self.write_slots:
+                      with self.status_lock:
+                          if time.monotonic() < self.retry_after:
+                              return
+                      payload = gzip.compress(json.dumps(
+                          {"version": 2, "files": self.data[i]},
+                          ensure_ascii=False, separators=(",", ":"),
+                      ).encode(), compresslevel=1)
+                      try:
+                          self.s3.put_object(Bucket=self.bucket, Key=self.key(i), Body=payload,
+                                             ContentType="application/gzip", CacheControl="no-store")
+                      except (BotoCoreError, ClientError) as exc:
+                          with self.status_lock:
+                              self.retry_after = time.monotonic() + 120
+                          print(f"::warning::同步记录分片 {i:02x} 保存失败（{type(exc).__name__}）；"
+                                "保留待保存状态，暂停保存请求 120 秒后重试，资产处理继续。", flush=True)
+                          return
+                      # 即使服务端已写入但响应超时，也保持 dirty，下次安全重写同一快照。
+                      self.dirty[i] = 0
 
-              def flush(self):
+              def flush(self, final=False):
+                  if final:
+                      # 收尾额外尝试；再次失败时共享退避阻止遍历重试全部分片。
+                      with self.status_lock:
+                          self.retry_after = 0.0
+
                   def save(i):
                       with self.locks[i]:
                           self.save_locked(i)
-                  with ThreadPoolExecutor(max_workers=8) as pool:
+
+                  with ThreadPoolExecutor(max_workers=2) as pool:
                       list(pool.map(save, range(self.SHARDS)))
 
 
           class Deployment:
-              def __init__(self, client, bucket, deadline, webp_version):
+              def __init__(self, client, bucket, deadline, webp_version, checkpoint_client=None):
                   self.s3 = client
                   self.bucket = bucket
                   self.deadline = deadline
                   self.webp_version = webp_version
+                  self.checkpoint_client = checkpoint_client if checkpoint_client is not None else client
                   self.inventory = None
                   self.checkpoints = None
                   self.conversions = threading.Semaphore(2)
@@ -263,7 +292,7 @@ jobs:
                       if n % 25 == 0:
                           print(f"批量列举远端：{n} 页，{len(self.inventory)} 个对象", flush=True)
                   print(f"远端清单读取完成：{len(self.inventory)} 个对象", flush=True)
-                  self.checkpoints = Checkpoints(self.s3, self.bucket, self.inventory, namespace)
+                  self.checkpoints = Checkpoints(self.checkpoint_client, self.bucket, self.inventory, namespace)
 
               def remember(self, key, source_hash, recipe_hash, verified):
                   if self.checkpoints:
@@ -420,7 +449,7 @@ jobs:
                           last_flush = time.monotonic()
                       fill()
               if deployment.checkpoints:
-                  deployment.checkpoints.flush()
+                  deployment.checkpoints.flush(final=True)
               remaining = len(files) - sum(counts.values()) + counts["deferred"] + counts["failed"]
               summary = (
                   f"总文件：{len(files)}\n\n"
@@ -432,6 +461,16 @@ jobs:
                   summary += "尚未完成。再次 Run workflow（force_path 留空）即可继续；失败详情见 rains3-report。\n"
               else:
                   summary += "本轮所选文件已全部同步。\n"
+              unsaved = sum(bool(n) for n in deployment.checkpoints.dirty) if deployment.checkpoints else 0
+              unread = sum(deployment.checkpoints.load_failures) if deployment.checkpoints else 0
+              if unread:
+                  summary += f"\n本轮有 {unread} 个同步记录分片无法读取，已回退到资产比对。\n"
+              if unsaved:
+                  summary += (
+                      f"\n注意：{unsaved} 个同步记录分片仍有更新未确认保存。"
+                      "下次运行会通过远端对象元数据或内容比对恢复，可能增加比对时间；"
+                      "资产是否齐全以上述仍需处理数量为准。\n"
+                  )
               print(summary, flush=True)
               if os.environ.get("GITHUB_STEP_SUMMARY"):
                   with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
@@ -461,13 +500,26 @@ jobs:
                   config=Config(
                       signature_version="s3v4", s3={"addressing_style": "path"},
                       retries={"mode": "standard", "total_max_attempts": 5},
-                      connect_timeout=15, read_timeout=60, max_pool_connections=workers * 3,
+                      connect_timeout=30, read_timeout=120, max_pool_connections=workers * 3,
+                      request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required",
+                  ),
+              )
+              # 断点缓存使用独立的短请求预算，避免保存缓存长时间阻塞资产处理。
+              checkpoint_client = boto3.client(
+                  "s3", endpoint_url=os.environ["S3_ENDPOINT"],
+                  region_name=os.environ.get("AWS_REGION", "cn-nb1"),
+                  config=Config(
+                      signature_version="s3v4", s3={"addressing_style": "path"},
+                      retries={"mode": "standard", "total_max_attempts": 2},
+                      connect_timeout=10, read_timeout=20, max_pool_connections=4,
                       request_checksum_calculation="when_required",
                       response_checksum_validation="when_required",
                   ),
               )
               print(f"比对文件数：{len(files)}；并行数：{workers}；预算：{minutes} 分钟", flush=True)
-              deployment = Deployment(client, os.environ["S3_BUCKET"], time.monotonic() + minutes * 60, version)
+              deployment = Deployment(client, os.environ["S3_BUCKET"], time.monotonic() + minutes * 60,
+                                      version, checkpoint_client=checkpoint_client)
               deployment.prepare(os.environ.get("GITHUB_REPOSITORY", "default"))
               # 先补缺失资产，避免恢复时间被大量旧对象的首次内容检查占满。
               files.sort(key=lambda name: (remote_key(name) in deployment.inventory, name))
